@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-iCloud Sync with local cache (index.json)
+Simple iCloud Downloader (sid.py)
 
 Commands:
   1) Scan files (incremental):                     --scan
@@ -15,6 +15,7 @@ Notes:
 - Cache stored in '_cache' folder INSIDE the download_base.
 - BATCH SAVING enabled.
 - COOKIE ISOLATION enabled.
+- Now tracking persistent lifetime stats (scan/download time) in index.json.
 """
 
 import os
@@ -37,6 +38,13 @@ from pyicloud import PyiCloudService
 from pyicloud.exceptions import PyiCloudFailedLoginException, PyiCloudAPIResponseException
 
 API_FLAVOR = "pyicloud"
+
+# --- Version Info ---
+__author__ = "Erich Dev Hub"
+__title__ = "Simple iCloud Downloader (SiD)"
+__version__ = "0.1.1" 
+__repo__ = "https://github.com/erich-dev-hub/Simple-iCloud-Downloader"
+# --- End Version Info ---
 
 # ===================== COLORS =====================
 C_GREEN = "\033[92m"
@@ -66,7 +74,6 @@ def load_config(config_file):
     try:
         icloud_user = cfg["icloud"]["user"].strip()
         download_base = cfg["icloud"]["download_base"].strip()
-        # cache_dir removed from config, calculated automatically
     except Exception:
         print(f"{C_RED}❌ Error: invalid or missing config.ini.{C_RESET}")
         print("   Ensure a config.ini file exists with:")
@@ -149,7 +156,7 @@ class RollingSpeed:
         while len(self.samples) > 1 and self.samples[0][0] < cutoff:
             self.samples.popleft()
 
-    def speed_bps(self) -> float:
+    def speed_bps(self) -> float: # Bps = Bytes per second OR Items per second
         if len(self.samples) < 2: return 0.0
         t0, b0 = self.samples[0]
         t1, b1 = self.samples[-1]
@@ -159,14 +166,23 @@ class RollingSpeed:
 # ===================== CACHE (INDEX) =====================
 def load_index() -> Dict[str, Any]:
     if not os.path.exists(INDEX_PATH):
-        return {
+        idx = {
             "last_index_time": None,
             "last_download_time": None,
             "last_stream_total": None,
             "items": {}
         }
-    with open(INDEX_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    else:
+        with open(INDEX_PATH, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+
+    # Initialize stats (using Minutes and Megabytes as requested)
+    idx.setdefault("stats_total_items_scanned", 0)
+    idx.setdefault("stats_total_scan_time_minutes", 0.0)
+    idx.setdefault("stats_total_megabytes_downloaded", 0.0)
+    idx.setdefault("stats_total_download_time_minutes", 0.0)
+    
+    return idx
 
 def save_index(idx: Dict[str, Any]):
     tmp = INDEX_PATH + ".tmp"
@@ -255,12 +271,21 @@ class Panel:
         self.total_download_bytes = max(total_bytes, 0)
         self.bytes_done = 0
         self.start_ts = time.time()
-        self.speed = RollingSpeed(30.0)
+        
+        self.speed_dl_instant = RollingSpeed(10.0) 
+        self.speed_scan = RollingSpeed(30.0)
+        self.last_dl_sizes_mb = deque(maxlen=10)
+        self.last_dl_times_sec = deque(maxlen=10)
+        self.avg_dl_mb_per_sec = 0.0 
+        
         self.fixed_mode = True 
         self.first_printed = False
+        self.last_error = "" 
 
         self._stop = threading.Event()
+        # --- BUG FIX: Restore target to _heartbeat_loop ---
         self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        # --- END BUG FIX ---
         self._last_render = 0.0
 
     def start_heartbeat(self): self._thread.start()
@@ -268,24 +293,40 @@ class Panel:
     def _heartbeat_loop(self):
         while not self._stop.is_set():
             self.render()
-            time.sleep(1.0)
+            time.sleep(1.0) # 1Hz refresh rate
 
-    def add_bytes(self, inc: int):
-        if inc > 0:
-            self.bytes_done += inc
-            self.speed.add(inc)
+    def log_download(self, size_bytes: int, time_sec: float):
+        """Called *after* a download finishes to log its stats."""
+        if size_bytes > 0:
+            self.bytes_done += size_bytes
+            self.speed_dl_instant.add(size_bytes)
+            
+            self.last_dl_sizes_mb.append(size_bytes / (1024*1024.0))
+            self.last_dl_times_sec.append(time_sec)
+            
+            total_mb = sum(self.last_dl_sizes_mb)
+            total_sec = sum(self.last_dl_times_sec)
+            if total_sec > 0:
+                self.avg_dl_mb_per_sec = total_mb / total_sec
 
     def inc_scan(self, inc: int = 1):
-        if inc > 0: self.scan_done += inc
+        if inc > 0:
+            self.scan_done += inc
+            self.speed_scan.add(inc)
 
     def set_scan_target(self, n: int): self.scan_target = max(n, 0)
     def set_total_download_bytes(self, n: int): self.total_download_bytes = max(n, 0)
     def set_total_known(self, n: int): self.total_known = n
+    def set_last_error(self, err_msg: str):
+        self.last_error = err_msg
 
-    def _bar(self, pct: float, width: int = 25) -> str:
+    def _bar(self, pct: float, width: int = 25, color: str = "") -> str:
         pct = max(0.0, min(100.0, pct))
         filled = int(round((pct/100.0) * width))
-        return "█"*filled + " "*(width-filled)
+        bar_str = "█"*filled + " "*(width-filled)
+        if color:
+            return f"{color}{bar_str}{C_RESET}"
+        return bar_str
 
     def _fmt_time(self, secs: float) -> str:
         secs = int(max(0, secs))
@@ -299,11 +340,54 @@ class Panel:
         scan_pct = (100.0 * self.scan_done / self.scan_target) if self.scan_target else 0.0
         dl_pct   = (100.0 * self.bytes_done / self.total_download_bytes) if self.total_download_bytes else 0.0
         elapsed  = now - self.start_ts
-        spd      = self.speed.speed_bps()
-        eta = 0.0
-        if self.total_download_bytes and spd > 0:
-            remaining = max(self.total_download_bytes - self.bytes_done, 0)
-            eta = remaining / spd
+        
+        scan_speed_ips = self.speed_scan.speed_bps()
+        dl_speed_bps = self.speed_dl_instant.speed_bps()
+        
+        eta_scan_sec = 0.0
+        eta_dl_sec = 0.0
+        eta_str = "ETA: ...?" 
+
+        # Rule C: Unknown Zone (Scan has passed 100%)
+        if self.scan_done > self.scan_target:
+             eta_str = "ETA: ...?"
+        
+        # Rule A: Scan Mode
+        elif self.only_scan:
+            if scan_speed_ips > 0:
+                items_remaining = max(self.scan_target - self.scan_done, 0)
+                eta_scan_sec = items_remaining / scan_speed_ips
+            
+            if eta_scan_sec > 0:
+                eta_str = f"ETA ≈ {self._fmt_time(eta_scan_sec)}"
+            else:
+                eta_str = "ETA: ...?" 
+        
+        # Rule B: Download Mode
+        elif not self.only_scan:
+            # Only calculate full ETA if we have a stable average download speed
+            if self.avg_dl_mb_per_sec > 0:
+                if scan_speed_ips > 0:
+                    items_remaining = max(self.scan_target - self.scan_done, 0)
+                    eta_scan_sec = items_remaining / scan_speed_ips
+                
+                bytes_remaining = max(self.total_download_bytes - self.bytes_done, 0)
+                mb_remaining = bytes_remaining / (1024*1024.0)
+                eta_dl_sec = mb_remaining / self.avg_dl_mb_per_sec
+                
+                total_eta_sec = eta_scan_sec + eta_dl_sec
+                
+                if total_eta_sec > 0:
+                    eta_str = f"ETA ≈ {self._fmt_time(total_eta_sec)}"
+                else:
+                    eta_str = "ETA: ...?" # Calculation resulted in zero
+            else:
+                # In download mode, but haven't successfully downloaded anything yet
+                eta_str = "ETA: ...?"
+        
+        speed_display_str = ""
+        if dl_speed_bps > 0 and not self.only_scan:
+            speed_display_str = f"| {format_bytes(int(dl_speed_bps))}/s"
 
         header_user = f"{C_GREEN}iCloud User: {self.user}{C_RESET}"
         header_mode = f"Mode: {C_CYAN}{self.mode_str}{C_RESET}"
@@ -315,32 +399,40 @@ class Panel:
         header1 = "=" * 80
         
         if self.only_scan:
-            header2 = f"📂 Current Index Size: {self.total_known:,} items"
+            header2 = f"📂 Total Known Items: {self.total_known:,}"
         else:
-            header2 = (f"📂 Total indexed: {self.total_known:,} | "
+            header2 = (f"📂 Total: {self.total_known:,} | "
                        f"Synced: {self.synced_count:,} | "
-                       f"Downloading: {self.to_get_count:,}...")
+                       f"DL'ing: {self.to_get_count:,} {speed_display_str}")
             
         header3 = "-" * 80
         
-        line_scan = (f"[🔎] Scan      : {scan_pct:6.2f}% | {self._bar(scan_pct)} | "
+        line_scan = (f"[🔎] Scan      : {scan_pct:6.2f}% | {self._bar(scan_pct, width=25)} | "
                      f"{self.scan_done:,} / {self.scan_target:,} items")
         
-        line_dl   = (f"[⬇️] Download  : {dl_pct:6.2f}% | {self._bar(dl_pct)} | "
+        line_dl   = (f"[⬇️] Download  : {dl_pct:6.2f}% | {self._bar(dl_pct, width=25, color=C_CYAN)} | "
                      f"{format_bytes(self.bytes_done)} / {format_bytes(self.total_download_bytes)}")
         
-        line_tm   = (f"[⏱️] Time      :  {self._fmt_time(elapsed)} elapsed"
-                     f"  | ETA ≈ {self._fmt_time(eta)} | {format_bytes(int(spd))}/s")
+        line_tm   = (f"[⏱️] Time      :  {self._fmt_time(elapsed)} elapsed  | {eta_str}")
         
         if self.only_scan:
             footer = f"\n{C_YELLOW}Stop by pressing CTRL + C.{C_RESET}"
-            line_tm_scan = f"[⏱️] Time      :  {self._fmt_time(elapsed)} elapsed"
-            block = "\n".join([header_user, header_mode, extra_filter, header1, header2, header3, line_scan, line_tm_scan, header1, footer])
+            if eta_scan_sec <= 0: eta_scan_str = "ETA: ...?"
+            else: eta_scan_str = f"ETA ≈ {self._fmt_time(eta_scan_sec)}"
+            
+            line_tm_scan = f"[⏱️] Time      :  {self._fmt_time(elapsed)} elapsed  | {eta_scan_str}"
+            block = "\n".join([header_user, header_mode, extra_filter, header1, header2, header3, line_scan, line_tm_scan, header1])
         else:
             footer = (f"\n{C_YELLOW}Stop by pressing CTRL + C. "
                       f"For resuming, just run the command again.{C_RESET}")
-            block = "\n".join([header_user, header_mode, extra_filter, header1, header2, header3, line_scan, line_dl, line_tm, header1, footer])
-            
+            block = "\n".join([header_user, header_mode, extra_filter, header1, header2, header3, line_scan, line_dl, line_tm, header1])
+        
+        if self.last_error:
+            err_short = self.last_error.replace('\n', ' ')
+            if len(err_short) > 78: err_short = err_short[:75] + "..."
+            block += f"\n{C_RED}{err_short}{C_RESET}"
+        
+        block += footer
         block = block.replace("\n\n", "\n")
 
         if self.fixed_mode:
@@ -360,22 +452,21 @@ def scan_files(api: PyiCloudService, index: Dict[str, Any]) -> Dict[str, Any]:
     last_iso = index.get("last_index_time")
     since_dt = from_iso(last_iso)
     
-    total_known = len(items)
+    total_known_local = len(items)
     last_stream_val = index.get("last_stream_total") or 0
-    estimated_total = max(last_stream_val, total_known, 1)
+    total_known_display = max(last_stream_val, total_known_local, 1)
 
     panel = Panel(user=ICLOUD_USER,
                   mode_str="SCAN FILES",
                   filter_msg="",
                   to_get_count=0,
-                  total_known=total_known,
+                  total_known=total_known_display, 
                   synced_count=0,
                   total_bytes=0,
                   only_scan=True)
     
-    panel.set_scan_target(estimated_total)
+    panel.set_scan_target(total_known_display) 
     
-    print("Scanning iCloud metadata (may take a while on 1st run)...")
     try:
         stream = stream_since(api, since_dt) if since_dt else stream_all(api)
     except Exception as e:
@@ -387,6 +478,9 @@ def scan_files(api: PyiCloudService, index: Dict[str, Any]) -> Dict[str, Any]:
 
     unsaved_changes_count = 0
     last_save_ts = time.time()
+    
+    session_scan_start_time = time.time()
+    count_seen = 0
 
     def request_save_index(force=False):
         nonlocal unsaved_changes_count, last_save_ts
@@ -402,7 +496,7 @@ def scan_files(api: PyiCloudService, index: Dict[str, Any]) -> Dict[str, Any]:
         interrupted["flag"] = True
     signal.signal(signal.SIGINT, _sigint)
 
-    count_seen = 0
+    current_total_in_json = total_known_local
     
     try:
         for photo in stream:
@@ -411,9 +505,9 @@ def scan_files(api: PyiCloudService, index: Dict[str, Any]) -> Dict[str, Any]:
             
             if interrupted["flag"]: break
 
-            if count_seen > estimated_total:
-                estimated_total = count_seen
-                panel.set_scan_target(estimated_total)
+            if count_seen > total_known_display:
+                total_known_display = count_seen
+                panel.set_scan_target(total_known_display)
 
             pid = get_photo_id(photo)
             if not pid:
@@ -431,8 +525,8 @@ def scan_files(api: PyiCloudService, index: Dict[str, Any]) -> Dict[str, Any]:
                     "size": size, "downloaded": False, "local_path": None, "downloaded_at": None, "sha256": None
                 }
                 unsaved_changes_count += 1
-                total_known += 1
-                panel.set_total_known(total_known) 
+                current_total_in_json += 1
+                panel.set_total_known(current_total_in_json) 
             else:
                 changed = False
                 fn = getattr(photo, "filename", rec.get("filename"))
@@ -449,11 +543,19 @@ def scan_files(api: PyiCloudService, index: Dict[str, Any]) -> Dict[str, Any]:
             request_save_index(force=False)
 
     except Exception as e:
-        pass
+        panel.set_last_error(f"Stream error: {e}")
 
     finally:
-        index["last_stream_total"] = count_seen
+        session_total_scan_time_sec = time.time() - session_scan_start_time
+        
+        if not interrupted["flag"]:
+            index["last_stream_total"] = count_seen
+        
         index["last_index_time"] = now_utc_iso()
+        
+        index["stats_total_items_scanned"] += count_seen
+        index["stats_total_scan_time_minutes"] += (session_total_scan_time_sec / 60.0)
+        
         request_save_index(force=True)
         
         panel.stop_heartbeat()
@@ -481,8 +583,8 @@ def view_stats(index: Dict[str, Any]):
         return
 
     agg = {}
-    total_all = 0
-    total_all_bytes = 0
+    total_all_items_in_index = 0 
+    total_all_bytes_in_index = 0
     total_dl = 0
     total_dl_bytes = 0
     
@@ -500,10 +602,10 @@ def view_stats(index: Dict[str, Any]):
         entry = agg.setdefault(ym, {"count": 0, "bytes": 0, "dl_count": 0, "dl_bytes": 0})
 
         entry["count"] += 1
-        total_all += 1
+        total_all_items_in_index += 1 
         sz = rec.get("size") or 0
         entry["bytes"] += sz
-        total_all_bytes += sz
+        total_all_bytes_in_index += sz
 
         if rec.get("downloaded"):
             entry["dl_count"] += 1
@@ -515,9 +617,7 @@ def view_stats(index: Dict[str, Any]):
     THIN_LINE = "-" * 80
 
     print(SEP_LINE)
-    # Header Config:
-    # Month (8) | St. Files (22) | Size (23) | % (6) | Progress (15) | Borders (5) = 79 + 1 empty = 80
-    print(" Month  | St.      Files       |          Size         |  %   |   Progress    |")
+    print(" Month  | St.      Files       |          Size         |  %   |    Progress    |")
     print(THIN_LINE)
     
     for ym in sorted(agg.keys()):
@@ -537,22 +637,25 @@ def view_stats(index: Dict[str, Any]):
         s_b_dl = format_bytes(bytes_dl)
         s_b_tot = format_bytes(bytes_tot)
 
-        # Bar length fixed to 15
         bar_len = 15
         filled = int(pct / 100 * bar_len)
         bar_visual = "█" * filled + " " * (bar_len - filled)
         
         print(f"{ym} | {status} {s_c_dl:>7} / {s_c_tot:<7}  | {s_b_dl:>9} / {s_b_tot:<9} | {pct:>3.0f}% |{C_CYAN}{bar_visual}{C_RESET}|")
 
-    pct_all = (total_dl_bytes / total_all_bytes * 100.0) if total_all_bytes else 0.0
+    pct_all = (total_dl_bytes / total_all_bytes_in_index * 100.0) if total_all_bytes_in_index else 0.0
+    s_gt_b_dl = format_bytes(total_dl_bytes)
+    s_gt_b_tot = format_bytes(total_all_bytes_in_index)
+
+    last_stream_val = index.get("last_stream_total") or 0
+    total_display_count = max(total_all_items_in_index, last_stream_val)
+    
+    s_gt_dl = fmt_lim(total_dl, 99999)
+    s_gt_tot = fmt_lim(total_display_count, 99999) 
+
     bar_len = 15
     filled_all = int(pct_all / 100 * bar_len)
     bar_visual_all = "█" * filled_all + " " * (bar_len - filled_all)
-
-    s_gt_dl = fmt_lim(total_dl, 99999)
-    s_gt_tot = fmt_lim(total_all, 99999)
-    s_gt_b_dl = format_bytes(total_dl_bytes)
-    s_gt_b_tot = format_bytes(total_all_bytes)
 
     print(THIN_LINE)
     print(f"📦 TOTAL :   {s_gt_dl:>7} / {s_gt_tot:<7}  | {s_gt_b_dl:>9} / {s_gt_b_tot:<9} | {pct_all:>3.0f}% |{C_CYAN}{bar_visual_all}{C_RESET}|")
@@ -566,6 +669,52 @@ def view_stats(index: Dict[str, Any]):
     print()
 
 # ===================== DOWNLOAD =====================
+
+def plan_dest_dir_for(photo) -> str:
+    created = photo_created_dt(photo)
+    return os.path.join(DOWNLOAD_BASE, f"{created.year}", f"{created.year}_{created.month:02d}")
+
+def download_one(api: PyiCloudService, photo, dest_dir: str) -> str:
+    os.makedirs(dest_dir, exist_ok=True)
+    created = photo_created_dt(photo)
+    raw_name = getattr(photo, "filename", None) or f"{int(created.timestamp())}.bin"
+    fname = safe_filename(raw_name)
+    path = os.path.join(dest_dir, fname)
+
+    if os.path.exists(path):
+        base, ext = os.path.splitext(path)
+        i = 1
+        while True:
+            alt = f"{base}_{i:04d}{ext}"
+            if not os.path.exists(alt):
+                path = alt
+                break
+            i += 1
+
+    resp = photo.download()
+    if hasattr(resp, "iter_content"):
+        with open(path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+        return path
+
+    raw = getattr(resp, "raw", None)
+    if raw is not None and hasattr(raw, "read"):
+        with open(path, "wb") as f:
+            for chunk in iter(lambda: raw.read(1024 * 1024), b""):
+                if chunk:
+                    f.write(chunk)
+        return path
+
+    if isinstance(resp, (bytes, bytearray)):
+        with open(path, "wb") as f:
+            f.write(resp)
+        return path
+
+    raise RuntimeError("Download response type not supported.")
+
+
 def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set[str]):
     items = index.get("items", {})
     if not items:
@@ -573,10 +722,13 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
         index = scan_files(api, index)
         items = index.get("items", {})
 
-    # Identify what to download based on FILTER
-    to_get_pids = []
-    expected_bytes = 0
+    total_known_local = len(items)
+    last_stream_val = index.get("last_stream_total") or 0
+    total_known_display = max(last_stream_val, total_known_local)
+
     synced_count = 0
+    to_get_pids_from_index = []
+    expected_bytes = 0
     
     for pid, rec in items.items():
         if rec.get("downloaded"):
@@ -590,12 +742,18 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
                 if ym not in filter_months:
                     continue 
         
-        to_get_pids.append(pid)
+        to_get_pids_from_index.append(pid)
         expected_bytes += (rec.get("size") or 0)
 
-    to_get_set = set(to_get_pids)
-    total_known = len(items)
+    to_get_set = set(to_get_pids_from_index)
     
+    to_get_count_display = 0
+    if filter_months:
+        to_get_count_display = len(to_get_set)
+    else:
+        to_get_count_display = total_known_display - synced_count
+
+
     filter_msg = ""
     if filter_months:
         sorted_m = sorted(list(filter_months))
@@ -606,14 +764,13 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
     last_dl = from_iso(index.get("last_download_time"))
     since_dt = (last_dl - timedelta(seconds=1)) if last_dl else None
 
-    last_stream_val = index.get("last_stream_total") or 0
-    estimated_total_items = max(last_stream_val, total_known, 1)
+    estimated_total_items = max(last_stream_val, total_known_local, 1)
 
     panel = Panel(user=ICLOUD_USER,
                   mode_str="DOWNLOAD",
                   filter_msg=filter_msg,
-                  to_get_count=len(to_get_set),
-                  total_known=total_known,
+                  to_get_count=to_get_count_display,
+                  total_known=total_known_display, 
                   synced_count=synced_count,
                   total_bytes=expected_bytes)
     
@@ -624,6 +781,11 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
 
     unsaved_changes_count = 0
     last_save_ts = time.time()
+    
+    session_items_scanned = 0
+    session_scan_time_sec = 0.0
+    session_bytes_dl = 0
+    session_dl_time_sec = 0.0
 
     def request_save_index(force=False):
         nonlocal unsaved_changes_count, last_save_ts
@@ -639,7 +801,6 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
         interrupted["flag"] = True
     signal.signal(signal.SIGINT, _sigint)
 
-    # --- SCAN ---
     try:
         stream = stream_all(api)
     except Exception as e:
@@ -648,9 +809,12 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
         return
 
     total_seen_this_run = 0
-
+    main_scan_loop_start = time.time()
+    
     try:
         for photo in stream:
+            dl_time_this_loop = 0.0 
+            
             total_seen_this_run += 1
             panel.inc_scan(1) 
             if interrupted["flag"]: break
@@ -667,13 +831,18 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
             rec = index["items"].get(pid)
             if rec is None:
                 created = photo_created_dt(photo)
-                index["items"][pid] = {
+                rec = {
                     "id": pid, "filename": getattr(photo, "filename", f"{int(created.timestamp())}.bin"),
                     "created": created.isoformat(),
                     "size": getattr(photo, "size", None),
                     "downloaded": False, "local_path": None, "downloaded_at": None, "sha256": None
                 }
+                index["items"][pid] = rec
                 unsaved_changes_count += 1
+                
+                ym = created.strftime("%Y-%m")
+                if (not filter_months) or (ym in filter_months):
+                    to_get_set.add(pid) 
             else:
                 changed = False
                 fn = getattr(photo, "filename", rec.get("filename"))
@@ -682,17 +851,20 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
                     changed = True
                 sz = getattr(photo, "size", None)
                 if (sz is not None) and (rec.get("size") != sz):
-                    if rec.get("downloaded"):
-                        pass 
                     rec["size"] = sz
                     changed = True
                 if changed:
                     unsaved_changes_count += 1
 
             if pid in to_get_set:
+                sz_now = rec.get("size")
                 try:
                     dest_dir = plan_dest_dir_for(photo)
+                    
+                    dl_start = time.time()
                     path = download_one(api, photo, dest_dir)
+                    dl_time_this_loop = time.time() - dl_start
+                    session_dl_time_sec += dl_time_this_loop 
 
                     rec2 = index["items"][pid]
                     file_hash = None
@@ -705,29 +877,46 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
                     rec2["downloaded"] = True
                     
                     unsaved_changes_count += 1
-                    sz_now = rec2.get("size")
+                    
                     if sz_now is not None:
-                        panel.add_bytes(sz_now)
-
+                        panel.log_download(sz_now, dl_time_this_loop)
+                        session_bytes_dl += sz_now 
+                    
+                    to_get_set.remove(pid)
+                    
                 except Exception as e:
-                    pass
+                    panel.set_last_error(f"Failed '{rec.get('filename')}': {e}")
+                    pass 
 
-                to_get_set.remove(pid)
-            
             request_save_index(force=False)
-            if not to_get_set: break
+            if (not to_get_set) and (not filter_months):
+                break
 
-    except Exception:
-        pass
+    except Exception as e:
+        panel.set_last_error(f"Stream error: {e}")
 
     finally:
-        current_max = max(index.get("last_stream_total") or 0, total_seen_this_run)
-        index["last_stream_total"] = current_max
+        main_scan_total_time = time.time() - main_scan_loop_start
+        main_scan_only_time = main_scan_total_time - session_dl_time_sec
+        
+        if not interrupted["flag"]:
+            index["last_stream_total"] = total_seen_this_run
+            
+        index["stats_total_items_scanned"] += total_seen_this_run
+        index["stats_total_scan_time_minutes"] += (main_scan_only_time / 60.0)
+        index["stats_total_megabytes_downloaded"] += (session_bytes_dl / (1024*1024.0))
+        index["stats_total_download_time_minutes"] += (session_dl_time_sec / 60.0)
+        
         request_save_index(force=True)
         panel.render()
 
     # --- INCREMENTAL ---
     if not interrupted["flag"]:
+        inc_dl_time_sec = 0.0
+        inc_bytes_dl = 0
+        inc_scan_items = 0
+        inc_scan_start = time.time()
+        
         try:
             stream_inc = stream_since(api, since_dt) if since_dt else []
         except: stream_inc = []
@@ -736,6 +925,8 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
 
         try:
             for photo in stream_inc:
+                dl_time_this_loop = 0.0
+                inc_scan_items += 1
                 panel.inc_scan(1) 
                 if interrupted["flag"]: break
 
@@ -758,7 +949,12 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
                     if should_dl:
                         try:
                             dest_dir = plan_dest_dir_for(photo)
+                            
+                            dl_start = time.time()
                             path = download_one(api, photo, dest_dir)
+                            dl_time_this_loop = time.time() - dl_start
+                            inc_dl_time_sec += dl_time_this_loop
+                            
                             rec2 = index["items"].setdefault(pid, {
                                 "id": pid, "filename": filename, "created": created.isoformat(),
                                 "size": size, "downloaded": False, "local_path": None, "downloaded_at": None, "sha256": None
@@ -770,17 +966,31 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
                             rec2["sha256"] = h
                             rec2["downloaded"] = True
                             unsaved_changes_count += 1
-                            if size: panel.add_bytes(size)
-                        except: pass
+                            if size: 
+                                panel.log_download(size, dl_time_this_loop)
+                                inc_bytes_dl += size
+                        except Exception as e:
+                            panel.set_last_error(f"Failed '{filename}': {e}")
 
                 if (newest_time is None) or (created > newest_time):
                     newest_time = created
                 
                 request_save_index(force=False)
-        except: pass
+        except Exception as e:
+            panel.set_last_error(f"Incremental stream error: {e}")
+        
+        finally:
+            inc_scan_total_time = time.time() - inc_scan_start
+            inc_scan_only_time = inc_scan_total_time - inc_dl_time_sec
 
-        if newest_time and not interrupted["flag"]:
-            index["last_download_time"] = newest_time.astimezone(timezone.utc).isoformat()
+            if newest_time and not interrupted["flag"]:
+                index["last_download_time"] = newest_time.astimezone(timezone.utc).isoformat()
+            
+            index["stats_total_items_scanned"] += inc_scan_items
+            index["stats_total_scan_time_minutes"] += (inc_scan_only_time / 60.0)
+            index["stats_total_megabytes_downloaded"] += (inc_bytes_dl / (1024*1024.0))
+            index["stats_total_download_time_minutes"] += (inc_dl_time_sec / 60.0)
+            
             request_save_index(force=True)
 
     panel.stop_heartbeat()
@@ -838,18 +1048,20 @@ def main():
         sys.argv.extend(show_menu())
 
     ap = argparse.ArgumentParser(description="iCloud sync with cache (index.json)")
-    ap.add_argument("--scan", action="store_true", help="Scan iCloud library for new files.")    
+    ap.add_argument("--scan", action="store_true", help="Scan iCloud library for new files.")   
     ap.add_argument("--download", action="store_true", help="Download missing files.")
     ap.add_argument("--view", action="store_true", help="Show summary by month.")
     ap.add_argument("--logout", action="store_true", help="Terminate local session.")
     ap.add_argument("--filter", type=str, help="Filter months (YYYY-MM;YYYY-MM) for download only.")
     ap.add_argument("--config", type=str, default="config.ini", help="Config file.")
+    ap.add_argument("--update-index", action="store_true", help=argparse.SUPPRESS) 
+    ap.add_argument("--view-months", action="store_true", help=argparse.SUPPRESS)
+    
     args = ap.parse_args()
 
     global ICLOUD_USER, DOWNLOAD_BASE, CACHE_DIR, INDEX_PATH
 
     ICLOUD_USER, DOWNLOAD_BASE = load_config(args.config)
-    # CACHE_DIR calculated dynamically based on download_base
     CACHE_DIR = os.path.join(DOWNLOAD_BASE, "_cache")
     INDEX_PATH = os.path.join(CACHE_DIR, "index.json")
     
@@ -864,7 +1076,7 @@ def main():
         perform_logout()
         return
 
-    if (args.view) and not (args.scan or args.download):
+    if (args.view or args.view_months) and not (args.scan or args.update_index or args.download):
         index = load_index()
         view_stats(index)
         return
@@ -872,14 +1084,14 @@ def main():
     api = login_icloud()
     index = load_index()
 
-    if args.scan:
+    if args.scan or args.update_index:
         index = scan_files(api, index)
 
     if args.download:
         filter_set = validate_filter(args.filter)
         download_all(api, index, filter_set)
 
-    if not (args.scan or args.download or args.view):
+    if not (args.scan or args.update_index or args.download or args.view or args.view_months):
         print("ℹ️  Nothing to do.")
 
 if __name__ == "__main__":

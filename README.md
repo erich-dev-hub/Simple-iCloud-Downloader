@@ -2,6 +2,8 @@
 
 [🇧🇷 Leia em Português](README.pt-br.md)
 
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/erich-dev-hub/Simple-iCloud-Downloader?display_mode=release)
+
 A Python-based tool to download, organize, and sync photos and videos from iCloud to your local storage. It automatically organizes files by `Year/Month` and maintains a local cache to prevent duplicates, ensuring speed and data integrity.
 
 > **⚠️ DISCLAIMER & LEGAL NOTICE**
@@ -19,10 +21,11 @@ A Python-based tool to download, organize, and sync photos and videos from iClou
 ## 🚀 Features
 
 * **Smart Synchronization:** Downloads only new files (Incremental Sync).
+* **One-Way Backup (Read-Only):** This tool is a *downloader*, not a two-way mirror. It only reads from iCloud. It will **never** delete, modify, or upload files, either on your local drive or in your iCloud account. Files deleted from iCloud will simply be skipped in future scans, but *remain* in your local backup.
 * **Organization:** Automatically sorts files into folders: `Download_Folder/YYYY/YYYY_MM/`.
 * **Local Cache:** Uses a JSON index to track downloaded files, ensuring speed and avoiding duplicates.
 * **Batch Saving:** Optimizes disk I/O by saving the index only after specific intervals, protecting SSD lifespan.
-* **Resumable:** Can be interrupted (`CTRL + C`) and resumed at any time without data corruption.
+* **Resumable:** Can be interrupted (`CTRL + C` or a power outage) and resumed at any time without data corruption.
 * **Filtering:** Option to download only specific months.
 * **Multiple Users:** Can sync multiple iCloud accounts into separate folders by setting users/folders in different config.ini files.
 * **Privacy:** Session cookies are isolated in the download directory.
@@ -180,6 +183,14 @@ John wants to check how his photos are distributed to see if he can remove old d
 3.  To back up just that month, he runs `python sid.py --download --filter "2016-11"`.
 4.  The script scans all items (for integrity) but only downloads the files from November 2016.
 5.  He runs `python sid.py --view` again to confirm that the "2016-11" line now shows 100%. After checking the files are safe on his local drive, he can confidently delete them from iCloud to free up space.
+
+#### Scenario 3: The Resilient Download (Daniel)
+Daniel has many terabytes of data and knows the first download will take days.
+
+1.  He starts the backup by running `python sid.py` and selecting **Option 2 (Download Everything)**. He leaves it running and goes to sleep.
+2.  Overnight, a power outage shuts down his computer when it is only halfway done.
+3.  The next day, Daniel restarts his computer. He simply runs `python sid.py` and selects **Option 2** again.
+4.  The script instantly reads its `index.json` cache, recognizes the tens of thousands of files it already downloaded, and skips them. It automatically resumes downloading only the remaining files from where it left off.
 
 ---
 
