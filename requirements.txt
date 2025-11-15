@@ -1,0 +1,5 @@
+﻿pyicloud
+tqdm
+requests
+keyring
+future
