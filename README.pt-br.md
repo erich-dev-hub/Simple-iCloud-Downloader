@@ -2,7 +2,7 @@
 
 [🇺🇸 Read in English](README.md)
 
-![GitHub release (mais recente por data)](https://img.shields.io/github/v/release/erich-dev-hub/Simple-iCloud-Downloader?display_mode=release)
+![GitHub release (mais recente por data)](https://img.shields.io/github/v/release/erich-dev-hub/Simple-iCloud-Downloader?include_prereleases)
 
 Uma ferramenta baseada em Python para baixar, organizar e sincronizar fotos e vídeos do iCloud para o seu armazenamento local. Ela organiza automaticamente os arquivos por `Ano/Mês` e mantém um cache local para evitar duplicatas, garantindo velocidade e integridade dos dados.
 
@@ -38,6 +38,25 @@ Uma ferramenta baseada em Python para baixar, organizar e sincronizar fotos e v�
 * **SO:** Windows 10/11 (Suporte principal), Linux ou macOS.
 * **Python:** Versão 3.12 ou superior (Testado na 3.13.3).
 * **Dependências:** `pyicloud`, `tqdm`, `requests`, `keyring`.
+
+---
+
+## ⚠️ Importante: Pré-requisitos da Conta iCloud
+
+Para esta ferramenta funcionar, sua conta do iCloud **precisa** estar configurada com as seguintes opções. O script acessa os dados via API web oficial (simulando um navegador no iCloud.com), e estas configurações são obrigatórias.
+
+### 1. Ativar "Acessar dados do iCloud na Web"
+* **O que faz:** Esta configuração permite que sua conta seja acessada pelo site iCloud.com.
+* **Onde:** No seu iPhone/iPad: `Ajustes > [Seu Nome] > iCloud > Acessar dados do iCloud na Web`
+* **Estado Necessário:** **ATIVADO**
+* **Erro (se errado):** Se estiver desativado, o script falhará imediatamente no login com um erro de **`ACCESS_DENIED (Falha no Login)`**.
+
+### 2. Desativar "Proteção Avançada de Dados"
+* **O que faz:** Esta é uma camada de segurança extra e opcional da Apple que fornece criptografia de ponta a ponta para fotos, backups e mais.
+* **Por que é um problema:** Quando ativada, os *servidores* da Apple não possuem as chaves para descriptografar suas fotos. Como este script se conecta aos servidores (e não ao seu celular), o servidor não pode acessar os dados para enviá-los.
+* **Onde:** No seu iPhone/iPad: `Ajustes > [Seu Nome] > iCloud > Proteção Avançada de Dados`
+* **Estado Necessário:** **DESATIVADO**
+* **Erro (se errado):** Se estiver ativado, o login e o scan funcionarão, mas todos os downloads falharão com um erro **`403 Forbidden`** (Proibido).
 
 ---
 
@@ -216,10 +235,18 @@ C:\Backup_iCloud\Meu_Nome\Fotos\
 
 ## ❓ Solução de Problemas
 
-* **Solicitação de 2FA:** Na primeira execução, será solicitado o código de autenticação de dois fatores (2FA) enviado ao seu dispositivo Apple.
-* **Erro 503 (Service Unavailable):** Se você vir este erro, a Apple está limitando suas requisições temporariamente.
+* **Falha no Login (ACCESS_DENIED):**
+  Este erro significa que suas credenciais podem estar corretas, mas sua conta está bloqueada para acesso web. Vá ao seu iPhone `Ajustes > [Seu Nome] > iCloud` e garanta que **`Acessar dados do iCloud na Web`** esteja **ATIVADO**.
+
+* **Erro 403 Forbidden (no Download):**
+  O script escaneia com sucesso, mas todos os downloads falham com um erro "403 Forbidden". Isso quase sempre significa que você está com a **`Proteção Avançada de Dados`** **ATIVADA**. Você deve desativar esta opção nos seus Ajustes do iCloud para que qualquer ferramenta web possa acessar suas fotos.
+
+* **Erro 503 (Service Unavailable):**
+  Se você vir este erro (geralmente durante o login), a Apple está limitando suas requisições temporariamente.
     * *Solução:* Aguarde 30 a 60 minutos e tente novamente.
-* **Erros de "Keyring":** Se tiver problemas com o armazenamento de senha, garanta que o Cofre de Credenciais do seu sistema operacional (Windows Credential Locker, etc.) esteja acessível.
+
+* **Erros de "Keyring":**
+  Se tiver problemas com o armazenamento de senha, garanta que o Cofre de Credenciais do seu sistema operacional (Windows Credential Locker, etc.) esteja acessível.
 
 ---
 

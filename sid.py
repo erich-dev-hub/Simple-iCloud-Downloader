@@ -42,7 +42,7 @@ API_FLAVOR = "pyicloud"
 # --- Version Info ---
 __author__ = "Erich Dev Hub"
 __title__ = "Simple iCloud Downloader (SiD)"
-__version__ = "0.1.1" 
+__version__ = "0.1.2" 
 __repo__ = "https://github.com/erich-dev-hub/Simple-iCloud-Downloader"
 # --- End Version Info ---
 
@@ -176,7 +176,6 @@ def load_index() -> Dict[str, Any]:
         with open(INDEX_PATH, "r", encoding="utf-8") as f:
             idx = json.load(f)
 
-    # Initialize stats (using Minutes and Megabytes as requested)
     idx.setdefault("stats_total_items_scanned", 0)
     idx.setdefault("stats_total_scan_time_minutes", 0.0)
     idx.setdefault("stats_total_megabytes_downloaded", 0.0)
@@ -236,6 +235,8 @@ def login_icloud() -> PyiCloudService:
     except PyiCloudFailedLoginException as e:
         sys.stdout.write("\n")
         print(f"{C_RED}❌ Login Failed: {e}{C_RESET}")
+        print(f"{C_YELLOW}   Please check your email/password and ensure 'Access iCloud Data on the Web'")
+        print(f"   is ENABLED in your iCloud settings (see README for details).{C_RESET}")
         sys.exit(1)
     except Exception as e:
         sys.stdout.write("\n")
@@ -273,19 +274,22 @@ class Panel:
         self.start_ts = time.time()
         
         self.speed_dl_instant = RollingSpeed(10.0) 
-        self.speed_scan = RollingSpeed(30.0)
         self.last_dl_sizes_mb = deque(maxlen=10)
         self.last_dl_times_sec = deque(maxlen=10)
         self.avg_dl_mb_per_sec = 0.0 
         
+        self.total_dl_time_this_session = 0.0
+        
         self.fixed_mode = True 
         self.first_printed = False
         self.last_error = "" 
+        
+        # --- FIX: ANSI code to clear from cursor to end of line ---
+        self.CLEAR_LINE = "\x1b[K"
+        # --- END FIX ---
 
         self._stop = threading.Event()
-        # --- BUG FIX: Restore target to _heartbeat_loop ---
         self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        # --- END BUG FIX ---
         self._last_render = 0.0
 
     def start_heartbeat(self): self._thread.start()
@@ -293,13 +297,13 @@ class Panel:
     def _heartbeat_loop(self):
         while not self._stop.is_set():
             self.render()
-            time.sleep(1.0) # 1Hz refresh rate
+            time.sleep(1.0) 
 
     def log_download(self, size_bytes: int, time_sec: float):
-        """Called *after* a download finishes to log its stats."""
-        if size_bytes > 0:
+        if size_bytes > 0 and time_sec > 0:
             self.bytes_done += size_bytes
             self.speed_dl_instant.add(size_bytes)
+            self.total_dl_time_this_session += time_sec
             
             self.last_dl_sizes_mb.append(size_bytes / (1024*1024.0))
             self.last_dl_times_sec.append(time_sec)
@@ -312,7 +316,6 @@ class Panel:
     def inc_scan(self, inc: int = 1):
         if inc > 0:
             self.scan_done += inc
-            self.speed_scan.add(inc)
 
     def set_scan_target(self, n: int): self.scan_target = max(n, 0)
     def set_total_download_bytes(self, n: int): self.total_download_bytes = max(n, 0)
@@ -331,6 +334,19 @@ class Panel:
     def _fmt_time(self, secs: float) -> str:
         secs = int(max(0, secs))
         return time.strftime("%H:%M:%S", time.gmtime(secs))
+    
+    def _fmt_time_eta(self, secs: float) -> str:
+        secs = int(max(0, secs))
+        
+        m, s = divmod(secs, 60)
+        h, m = divmod(m, 60)
+        
+        if secs < 300: # Less than 5 minutes
+            return f"{m}m:{s:02d}s left"
+        elif secs < 3600: # Less than 1 hour
+            return f"{m}m left"
+        else: # Hours
+            return f"{h}h:{m:02d}m left"
 
     def render(self):
         now = time.time()
@@ -341,31 +357,31 @@ class Panel:
         dl_pct   = (100.0 * self.bytes_done / self.total_download_bytes) if self.total_download_bytes else 0.0
         elapsed  = now - self.start_ts
         
-        scan_speed_ips = self.speed_scan.speed_bps()
         dl_speed_bps = self.speed_dl_instant.speed_bps()
+        
+        session_scan_time_sec = elapsed - self.total_dl_time_this_session
+        scan_speed_ips = 0.0
+        if session_scan_time_sec > 1:
+            scan_speed_ips = self.scan_done / session_scan_time_sec
         
         eta_scan_sec = 0.0
         eta_dl_sec = 0.0
         eta_str = "ETA: ...?" 
 
-        # Rule C: Unknown Zone (Scan has passed 100%)
         if self.scan_done > self.scan_target:
              eta_str = "ETA: ...?"
         
-        # Rule A: Scan Mode
         elif self.only_scan:
             if scan_speed_ips > 0:
                 items_remaining = max(self.scan_target - self.scan_done, 0)
                 eta_scan_sec = items_remaining / scan_speed_ips
             
             if eta_scan_sec > 0:
-                eta_str = f"ETA ≈ {self._fmt_time(eta_scan_sec)}"
+                eta_str = f"ETA ≈ {self._fmt_time_eta(eta_scan_sec)}"
             else:
                 eta_str = "ETA: ...?" 
         
-        # Rule B: Download Mode
         elif not self.only_scan:
-            # Only calculate full ETA if we have a stable average download speed
             if self.avg_dl_mb_per_sec > 0:
                 if scan_speed_ips > 0:
                     items_remaining = max(self.scan_target - self.scan_done, 0)
@@ -378,59 +394,59 @@ class Panel:
                 total_eta_sec = eta_scan_sec + eta_dl_sec
                 
                 if total_eta_sec > 0:
-                    eta_str = f"ETA ≈ {self._fmt_time(total_eta_sec)}"
+                    eta_str = f"ETA ≈ {self._fmt_time_eta(total_eta_sec)}"
                 else:
-                    eta_str = "ETA: ...?" # Calculation resulted in zero
+                    eta_str = "ETA: ...?"
             else:
-                # In download mode, but haven't successfully downloaded anything yet
                 eta_str = "ETA: ...?"
         
         speed_display_str = ""
         if dl_speed_bps > 0 and not self.only_scan:
             speed_display_str = f"| {format_bytes(int(dl_speed_bps))}/s"
 
-        header_user = f"{C_GREEN}iCloud User: {self.user}{C_RESET}"
-        header_mode = f"Mode: {C_CYAN}{self.mode_str}{C_RESET}"
+        # --- APPLY CLEAR_LINE TO ALL LINES ---
+        header_user = f"{C_GREEN}iCloud User: {self.user}{C_RESET}{self.CLEAR_LINE}"
+        header_mode = f"Mode: {C_CYAN}{self.mode_str}{C_RESET}{self.CLEAR_LINE}"
         
         extra_filter = ""
         if self.filter_msg:
-            extra_filter = f"\n{self.filter_msg}\n{C_DIM}(*) Filtering applies to downloads only. Full scan is performed.{C_RESET}"
+            extra_filter = f"\n{self.filter_msg}\n{C_DIM}(*) Filtering applies to downloads only. Full scan is performed.{C_RESET}{self.CLEAR_LINE}"
 
-        header1 = "=" * 80
+        header1 = ("=" * 80) + self.CLEAR_LINE
         
         if self.only_scan:
-            header2 = f"📂 Total Known Items: {self.total_known:,}"
+            header2 = f"📂 Total Known Items: {self.total_known:,}{self.CLEAR_LINE}"
         else:
             header2 = (f"📂 Total: {self.total_known:,} | "
                        f"Synced: {self.synced_count:,} | "
-                       f"DL'ing: {self.to_get_count:,} {speed_display_str}")
+                       f"DL'ing: {self.to_get_count:,} {speed_display_str}{self.CLEAR_LINE}")
             
-        header3 = "-" * 80
+        header3 = ("-" * 80) + self.CLEAR_LINE
         
         line_scan = (f"[🔎] Scan      : {scan_pct:6.2f}% | {self._bar(scan_pct, width=25)} | "
-                     f"{self.scan_done:,} / {self.scan_target:,} items")
+                     f"{self.scan_done:,} / {self.scan_target:,} items{self.CLEAR_LINE}")
         
         line_dl   = (f"[⬇️] Download  : {dl_pct:6.2f}% | {self._bar(dl_pct, width=25, color=C_CYAN)} | "
-                     f"{format_bytes(self.bytes_done)} / {format_bytes(self.total_download_bytes)}")
+                     f"{format_bytes(self.bytes_done)} / {format_bytes(self.total_download_bytes)}{self.CLEAR_LINE}")
         
-        line_tm   = (f"[⏱️] Time      :  {self._fmt_time(elapsed)} elapsed  | {eta_str}")
+        line_tm   = (f"[⏱️] Time      :  {self._fmt_time(elapsed)} elapsed  | {eta_str}{self.CLEAR_LINE}")
         
         if self.only_scan:
-            footer = f"\n{C_YELLOW}Stop by pressing CTRL + C.{C_RESET}"
+            footer = f"\n{C_YELLOW}Stop by pressing CTRL + C.{C_RESET}{self.CLEAR_LINE}"
             if eta_scan_sec <= 0: eta_scan_str = "ETA: ...?"
-            else: eta_scan_str = f"ETA ≈ {self._fmt_time(eta_scan_sec)}"
+            else: eta_scan_str = f"ETA ≈ {self._fmt_time_eta(eta_scan_sec)}"
             
-            line_tm_scan = f"[⏱️] Time      :  {self._fmt_time(elapsed)} elapsed  | {eta_scan_str}"
+            line_tm_scan = f"[⏱️] Time      :  {self._fmt_time(elapsed)} elapsed  | {eta_scan_str}{self.CLEAR_LINE}"
             block = "\n".join([header_user, header_mode, extra_filter, header1, header2, header3, line_scan, line_tm_scan, header1])
         else:
             footer = (f"\n{C_YELLOW}Stop by pressing CTRL + C. "
-                      f"For resuming, just run the command again.{C_RESET}")
+                      f"For resuming, just run the command again.{C_RESET}{self.CLEAR_LINE}")
             block = "\n".join([header_user, header_mode, extra_filter, header1, header2, header3, line_scan, line_dl, line_tm, header1])
         
         if self.last_error:
             err_short = self.last_error.replace('\n', ' ')
             if len(err_short) > 78: err_short = err_short[:75] + "..."
-            block += f"\n{C_RED}{err_short}{C_RESET}"
+            block += f"\n{C_RED}{err_short}{C_RESET}{self.CLEAR_LINE}"
         
         block += footer
         block = block.replace("\n\n", "\n")
@@ -617,7 +633,7 @@ def view_stats(index: Dict[str, Any]):
     THIN_LINE = "-" * 80
 
     print(SEP_LINE)
-    print(" Month  | St.      Files       |          Size         |  %   |    Progress    |")
+    print(" Month  | St.      Files        |          Size         |  %   |    Progress   |")
     print(THIN_LINE)
     
     for ym in sorted(agg.keys()):
@@ -817,6 +833,7 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
             
             total_seen_this_run += 1
             panel.inc_scan(1) 
+            
             if interrupted["flag"]: break
 
             if total_seen_this_run > estimated_total_items:
@@ -884,6 +901,17 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
                     
                     to_get_set.remove(pid)
                     
+                except PyiCloudAPIResponseException as e:
+                    if "403" in str(e) or "Forbidden" in str(e).upper():
+                        panel.stop_heartbeat()
+                        print(f"\n{C_RED}❌ CRITICAL ERROR: 403 Forbidden{C_RESET}")
+                        print(f"{C_YELLOW}   Failed to download '{rec.get('filename')}'. This almost always means")
+                        print(f"   you have 'Advanced Data Protection' enabled in your iCloud settings.")
+                        print(f"   Please disable it on your iPhone/iPad and try again (see README for details).{C_RESET}")
+                        sys.exit(1)
+                    else:
+                        panel.set_last_error(f"Failed '{rec.get('filename')}': {e}")
+                        pass
                 except Exception as e:
                     panel.set_last_error(f"Failed '{rec.get('filename')}': {e}")
                     pass 
@@ -928,6 +956,7 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
                 dl_time_this_loop = 0.0
                 inc_scan_items += 1
                 panel.inc_scan(1) 
+                
                 if interrupted["flag"]: break
 
                 pid = get_photo_id(photo)
@@ -969,6 +998,16 @@ def download_all(api: PyiCloudService, index: Dict[str, Any], filter_months: Set
                             if size: 
                                 panel.log_download(size, dl_time_this_loop)
                                 inc_bytes_dl += size
+                        except PyiCloudAPIResponseException as e:
+                            if "403" in str(e) or "Forbidden" in str(e).upper():
+                                panel.stop_heartbeat()
+                                print(f"\n{C_RED}❌ CRITICAL ERROR: 403 Forbidden{C_RESET}")
+                                print(f"{C_YELLOW}   Failed to download '{filename}'. This almost always means")
+                                print(f"   you have 'Advanced Data Protection' enabled in your iCloud settings.")
+                                print(f"   Please disable it on your iPhone/iPad and try again (see README for details).{C_RESET}")
+                                sys.exit(1)
+                            else:
+                                panel.set_last_error(f"Failed '{filename}': {e}")
                         except Exception as e:
                             panel.set_last_error(f"Failed '{filename}': {e}")
 
@@ -1053,7 +1092,11 @@ def main():
     ap.add_argument("--view", action="store_true", help="Show summary by month.")
     ap.add_argument("--logout", action="store_true", help="Terminate local session.")
     ap.add_argument("--filter", type=str, help="Filter months (YYYY-MM;YYYY-MM) for download only.")
-    ap.add_argument("--config", type=str, default="config.ini", help="Config file.")
+    
+    # --- CORREÇÃO DO BUG AQUI ---
+    ap.add_argument("--config", type=str, default="config.ini", help="Config file.") # Era add_Ggument
+    # --- FIM DA CORREÇÃO ---
+    
     ap.add_argument("--update-index", action="store_true", help=argparse.SUPPRESS) 
     ap.add_argument("--view-months", action="store_true", help=argparse.SUPPRESS)
     

@@ -2,7 +2,7 @@
 
 [🇧🇷 Leia em Português](README.pt-br.md)
 
-![GitHub release (latest by date)](https://img.shields.io/github/v/release/erich-dev-hub/Simple-iCloud-Downloader?display_mode=release)
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/erich-dev-hub/Simple-iCloud-Downloader?include_prereleases)
 
 A Python-based tool to download, organize, and sync photos and videos from iCloud to your local storage. It automatically organizes files by `Year/Month` and maintains a local cache to prevent duplicates, ensuring speed and data integrity.
 
@@ -38,6 +38,25 @@ A Python-based tool to download, organize, and sync photos and videos from iClou
 * **OS:** Windows 10/11 (Primary support), Linux, or macOS.
 * **Python:** Version 3.12 or newer (Tested on 3.13.3).
 * **Dependencies:** `pyicloud`, `tqdm`, `requests`, `keyring`.
+
+---
+
+## ⚠️ Important: iCloud Account Prerequisites
+
+For this tool to work, your iCloud account **must** be configured with the following settings. The script accesses data via the official web API (simulating a browser at iCloud.com), and these settings are mandatory.
+
+### 1. Enable "Access iCloud Data on the Web"
+* **What it does:** This setting allows your account to be accessed from iCloud.com.
+* **Where:** On your iPhone/iPad: `Settings > [Your Name] > iCloud > Access iCloud Data on the Web`
+* **Required State:** **ENABLED**
+* **Error if Wrong:** If this is disabled, the script will fail immediately upon login with an **`ACCESS_DENIED (Login Failed)`** error.
+
+### 2. Disable "Advanced Data Protection"
+* **What it does:** This is an optional security layer that end-to-end encrypts your photos, backups, and more.
+* **Why it's a problem:** When enabled, Apple's *servers* cannot decrypt your photos. Since this script connects to the servers (not your phone), the server cannot access the data to send it.
+* **Where:** On your iPhone/iPad: `Settings > [Your Name] > iCloud > Advanced Data Protection`
+* **Required State:** **DISABLED**
+* **Error if Wrong:** If this is enabled, login and scan will work, but all downloads will fail with a **`403 Forbidden`** error.
 
 ---
 
@@ -216,10 +235,18 @@ C:\Backup_iCloud\My_Name\Photos\
 
 ## ❓ Troubleshooting
 
-* **2FA Request:** On the first run, you will be asked to enter the 2FA code sent to your Apple device.
-* **Error 503 (Service Unavailable):** If you see this error, Apple is rate-limiting your requests.
+* **Login Failed (ACCESS_DENIED):**
+  This error means your credentials might be correct, but your account is blocked from web access. Go to your iPhone `Settings > [Your Name] > iCloud` and ensure **`Access iCloud Data on the Web`** is **ENABLED**.
+
+* **Error 403 Forbidden (on Download):**
+  The script scans successfully, but all downloads fail with a "403 Forbidden" error. This almost always means you have **`Advanced Data Protection`** **ENABLED**. You must disable this feature in your iCloud settings for any web-based tool to access your photos.
+
+* **Error 503 (Service Unavailable):**
+  If you see this error (often during login), Apple is rate-limiting your requests.
     * *Solution:* Wait 30 to 60 minutes and try again.
-* **"Keyring" Errors:** If you have issues with password storage, ensure your OS credential locker is accessible.
+
+* **"Keyring" Errors:**
+  If you have issues with password storage, ensure your OS credential locker is accessible.
 
 ---
 
